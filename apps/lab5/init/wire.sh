@@ -60,7 +60,10 @@ case "$1" in
         nfp init dma 0 ${CONFIG_DIR}/nfp_nbi8_dma_i32_i33.json &> $OUTPUT || exit 1
         echo "done"
 
-
+        nfp-macinit -0 /opt/netronome/share/nbi/sf1-2x40GE.json \
+               -p /opt/netronome/share/nbi/nfp_nbi_phy_tuning_AMDA0097R1.json \
+               -m 0
+        nfp-tminit -N 0 -c /opt/netronome/share/nbi/nfp_nbi_tm_2x40GE.json
         echo -n " - Enable RX..."
         #nfp -m mac -e set port rx 0 0 enable &> $OUTPUT || exit 1
         #nfp -m mac -e set port rx 0 4 enable &> $OUTPUT || exit 1

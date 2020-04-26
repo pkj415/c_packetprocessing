@@ -41,6 +41,7 @@ $(eval $(call microcode.add_flags,blm_obj,-DBLM_CUSTOM_CONFIG -DSINGLE_NBI -DPKT
 $(eval $(call microcode.add_flags,blm_obj,-DBLM_BLQ_EMEM_TYPE=emem -DNBII=8 -DBLM_INSTANCE_ID=0))
 $(eval $(call microcode.add_flags,blm_obj,-DBLM_INIT_EMU_RINGS))
 $(eval $(call microcode.add_flags,blm_obj,-DNFP_LIB_ANY_NFAS_VERSION))
+#$(eval $(call microcode.add_flags,blm_obj,-include $(app_src_dir)/config.h))
 $(eval $(call microcode.add_flags,blm_obj,-I$(microc_blocks_dir)/blm))
 $(eval $(call microcode.add_flags,blm_obj,-I$(microc_blocks_dir)/blm/_h))
 $(eval $(call microcode.add_flags,blm_obj,-I$(microc_blocks_dir)/blm/_uc))
@@ -52,17 +53,29 @@ $(eval $(call micro_c.compile_with_rtl,stats_obj,mac_stats.c))
 $(eval $(call micro_c.add_fw_libs,stats_obj,nfp std))
 
 #
-# Application definition
+# RX Application definition
 #
-$(eval $(call micro_c.compile_with_rtl,wire_obj,wire_main.c))
-$(eval $(call micro_c.add_fw_libs,wire_obj,nfp pkt std net))
-$(eval $(call micro_c.force_include,wire_obj,config))
-$(eval $(call fw.add_obj,wire,wire_obj,i32.me0 i32.me1 i32.me2 i32.me3 i32.me4 i32.me5 i32.me6 i32.me7 i32.me8 i32.me9 i32.me10 i32.me11))
-$(eval $(call fw.add_obj,wire,wire_obj,i33.me0 i33.me1 i33.me2 i33.me3 i33.me4 i33.me5 i33.me6 i33.me7 i33.me8 i33.me9 i33.me10 i33.me11))
-$(eval $(call fw.add_obj,wire,stats_obj,i34.me0))
-$(eval $(call fw.add_obj,wire,blm_obj,i48.me0))
-$(eval $(call fw.link_with_rtsyms,wire))
-$(eval $(call fw.add_ppc,wire,i8,$(PICO_CODE)))
+$(eval $(call micro_c.compile_with_rtl,rx_obj,rx.c))
+$(eval $(call micro_c.add_fw_libs,rx_obj,nfp pkt std net))
+$(eval $(call micro_c.add_flags,rx_obj,-I$(microc_blocks_dir)/blm))
+$(eval $(call micro_c.add_src_lib,rx_obj,libblm,$(microc_blocks_dir)/blm))
+$(eval $(call micro_c.force_include,rx_obj,config))
+
+#
+# TX Application definition
+#
+$(eval $(call micro_c.compile_with_rtl,tx_obj,tx.c))
+$(eval $(call micro_c.add_fw_libs,tx_obj,nfp pkt std net))
+$(eval $(call micro_c.add_flags,tx_obj,-I$(microc_blocks_dir)/blm))
+$(eval $(call micro_c.add_src_lib,tx_obj,libblm,$(microc_blocks_dir)/blm))
+$(eval $(call micro_c.force_include,tx_obj,config))
+
+$(eval $(call fw.add_obj,app,rx_obj,i32.me0))
+$(eval $(call fw.add_obj,app,tx_obj,i33.me0))
+$(eval $(call fw.add_obj,app,stats_obj,i34.me0))
+$(eval $(call fw.add_obj,app,blm_obj,i48.me0))
+$(eval $(call fw.link_with_rtsyms,app))
+$(eval $(call fw.add_ppc,app,i8,$(PICO_CODE)))
 
 #
 # Debug

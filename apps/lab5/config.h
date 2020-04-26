@@ -21,13 +21,18 @@
 #define __APP_CONFIG_H__
 
 
+#include "blm_custom.h"
+#include <stdint.h>
+
+#define UDP_PACKET_SZ_BYTES 1280
+
 /*
  * RX/TX configuration
  * - Configure RX checksum offload so the wire can validate checksums
  */
 #define CFG_RX_CSUM_PREPEND
 #define PKT_NBI_OFFSET          64
-#define MAC_PREPEND_BYTES       4
+#define MAC_PREPEND_BYTES       4 // Making this 8 causes issues
 
 /*
  * Mapping between channel and TM queue
@@ -52,5 +57,11 @@ enum port_type {
 #define PKTIO_MAX_TM_QUEUES 256
 #define PKT_PORT_QUEUE_of(_port)        ((_port) & ((PKTIO_MAX_TM_QUEUES) - 1))
 
+struct ring_meta {
+    uint64_t head;
+    uint64_t tail;
+    uint64_t len;
+    uint64_t buffer_full_cnt;
+};
 
 #endif /* __APP_CONFIG_H__ */

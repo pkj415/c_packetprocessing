@@ -1,0 +1,314 @@
+/* Flowenv */
+#include <nfp.h>
+#include <stdint.h>
+
+#include <pkt/pkt.h>
+#include <net/eth.h>
+#include <nfp/mem_atomic.h>
+#include <nfp/mem_bulk.h>
+#include <nfp/me.h>
+#include <pcie/compat.h>
+#include <pcie/pcie.h>
+#include <std/reg_utils.h>
+#include <blm.h>
+
+/*
+ * Mapping between channel and TM queue
+ */
+#ifndef NBI
+#define NBI 0
+#endif
+
+/* CTM credit defines */
+#define MAX_ME_CTM_PKT_CREDITS  256
+#define MAX_ME_CTM_BUF_CREDITS  32
+#define CTM_ALLOC_ERR 0xffffffff
+
+/* counters for out of credit situations */
+volatile __export __mem uint64_t gen_pkt_ctm_wait;
+volatile __export __mem uint64_t gen_pkt_blm_wait;
+
+__export __shared __cls struct ctm_pkt_credits ctm_credits_2 =
+           {MAX_ME_CTM_PKT_CREDITS, MAX_ME_CTM_BUF_CREDITS};
+
+/* DEBUG MACROS */
+__volatile __shared __emem uint32_t debug[8192*64];
+__volatile __shared __emem uint32_t debug_idx;
+
+#define DEBUG(_a, _b, _c, _d) do { \
+    __xrw uint32_t _idx_val = 4; \
+    __xwrite uint32_t _dvals[4]; \
+    mem_test_add(&_idx_val, \
+            (__mem40 void *)&debug_idx, sizeof(_idx_val)); \
+    _dvals[0] = _a; \
+    _dvals[1] = _b; \
+    _dvals[2] = _c; \
+    _dvals[3] = _d; \
+    mem_write_atomic(_dvals, (__mem40 void *)\
+                    (debug + (_idx_val % (1024 * 64))), sizeof(_dvals)); \
+    } while(0)
+
+#define DEBUG_MEM(_a, _len) do { \
+    int i = 0; \
+    __xrw uint32_t _idx_val = 4; \
+    __xwrite uint32_t _dvals[4]; \
+    mem_test_add(&_idx_val, \
+            (__mem40 void *)&debug_idx, sizeof(_idx_val)); \
+    _dvals[0] = 0x87654321; \
+    _dvals[1] = (uint64_t)_a >> 32; \
+    _dvals[2] = (uint64_t)_a & 0xffffffff; \
+    _dvals[3] = _len; \
+    mem_write_atomic(_dvals, (__mem40 void *)\
+                    (debug + (_idx_val % (1024 * 64))), sizeof(_dvals)); \
+    for (i = 0; i < (_len+15)/16; i++) { \
+      mem_test_add(&_idx_val, \
+              (__mem40 void *)&debug_idx, sizeof(_idx_val)); \
+      _dvals[0] = i*16 < _len ? *((__mem40 uint32_t *)_a+i*4) : 0x12345678; \
+      _dvals[1] = i*16 + 4 < _len ? *((__mem40 uint32_t *)_a+i*4+1) : 0x12345678; \
+      _dvals[2] = i*16 + 8 < _len ? *((__mem40 uint32_t *)_a+i*4+2) : 0x12345678; \
+      _dvals[3] = i*16 + 12 < _len ? *((__mem40 uint32_t *)_a+i*4+3) : 0x12345678; \
+      mem_write_atomic(_dvals, (__mem40 void *)\
+                      (debug + (_idx_val % (1024 * 64))), sizeof(_dvals)); \
+    } } while(0)
+
+
+// __declspec(shared ctm) is one copy shared by all threads in an ME, in CTM
+// __declspec(shared export ctm) is one copy shared by all MEs in an island in CTM (CTM default scope for 'export' of island)
+// __declspec(shared export imem) is one copy shared by all MEs on the chip in IMU (IMU default scope for 'export' of global)
+
+struct pkt_hdr {
+    struct {
+        uint32_t mac_timestamp;
+        uint32_t mac_prepend;
+    };
+    struct eth_vlan_hdr pkt;
+};
+
+struct pkt_rxed {
+    struct nbi_meta_catamaran nbi_meta;
+    struct pkt_hdr            pkt_hdr;
+};
+
+__declspec(shared mem) volatile uint64_t tx_buf_start;
+__declspec(shared mem) volatile struct ring_meta tx_meta;
+
+/*
+ * Fill out all the common parts of the DMA command structure, plus
+ * other setup required for DMA engines tests.
+ *
+ * Once setup, the caller only needs to patch in the PCIe address and
+ * is ready to go.
+ */
+__intrinsic static void
+pcie_dma_setup(__gpr struct nfp_pcie_dma_cmd *cmd,
+               int signo, uint32_t len, uint32_t dev_addr_hi, uint32_t dev_addr_lo)
+{
+    unsigned int meid = __MEID;
+
+    struct nfp_pcie_dma_cfg cfg;
+    __xwrite struct nfp_pcie_dma_cfg cfg_wr;
+    unsigned int mode_msk_inv;
+    unsigned int mode;
+
+    /* Zero the descriptor. Same size for 3200 and 6000 */
+    cmd->__raw[0] = 0;
+    cmd->__raw[1] = 0;
+    cmd->__raw[2] = 0;
+    cmd->__raw[3] = 0;
+
+    /* We just write config register 0 and 1. no one else is using them */
+    cfg.__raw = 0;
+    cfg.target_64_even = 1;
+    cfg.cpp_target_even = 7;
+    cfg.target_64_odd = 1;
+    cfg.cpp_target_odd = 7;
+
+    cfg_wr = cfg;
+    pcie_dma_cfg_set_pair(0, 0, &cfg_wr);
+
+    /* Signalling setup */
+    mode_msk_inv = ((1 << NFP_PCIE_DMA_CMD_DMA_MODE_shf) - 1);
+    mode = (((meid & 0xF) << 13) | (((meid >> 4) & 0x3F) << 7) |
+            ((__ctx() & 0x7) << 4) | signo);
+    cmd->__raw[1] = ((mode << NFP_PCIE_DMA_CMD_DMA_MODE_shf) |
+                     (cmd->__raw[1] & mode_msk_inv));
+
+    cmd->cpp_token = 0;
+    cmd->cpp_addr_hi = dev_addr_hi;
+    cmd->cpp_addr_lo = dev_addr_lo;
+    /* On the 6k the length is length - 1 */
+    cmd->length = len - 1;
+}
+
+void dma_packet_recv(__mem40 void *addr, uint8_t dma_len) {
+    __gpr struct nfp_pcie_dma_cmd dma_cmd;
+    __xwrite struct nfp_pcie_dma_cmd dma_cmd_rd;
+    SIGNAL cmpl_sig, enq_sig;
+
+    if (dma_len == 0) {
+        return;
+    }
+    pcie_dma_setup(&dma_cmd,
+        __signal_number(&cmpl_sig),
+        dma_len,
+        (uint32_t)((uint64_t)addr >> 32), (uint32_t)((uint64_t)addr & 0xffffffff));
+
+    dma_cmd.pcie_addr_hi = tx_meta.head >> 32;
+    dma_cmd.pcie_addr_lo = tx_meta.head & 0xffffffff;
+
+    dma_cmd_rd = dma_cmd;
+    __pcie_dma_enq(0, &dma_cmd_rd, NFP_PCIE_DMA_FROMPCI_HI,
+                     sig_done, &enq_sig);
+
+    wait_for_all(&cmpl_sig, &enq_sig);
+
+    tx_meta.head += dma_len;
+    if (tx_meta.head == (tx_buf_start + tx_meta.len)) {
+        tx_meta.head = tx_buf_start;
+    }
+}
+
+void dma_packet(__mem40 char* pbuf, int pkt_off, __mem40 void* muptr) {
+    int ctm_size = 256 << PKT_CTM_SIZE_256;
+    int ctm_part_len = UDP_PACKET_SZ_BYTES < (ctm_size - pkt_off) ? UDP_PACKET_SZ_BYTES : (ctm_size - pkt_off);
+    dma_packet_recv(pbuf+pkt_off, ctm_part_len);
+    dma_packet_recv(muptr, UDP_PACKET_SZ_BYTES - ctm_part_len);
+}
+
+void dma_packet_three_parts(__mem40 char* pbuf, int pkt_off, __mem40 void* muptr, int dma_first_len) {
+    int ctm_size = 256 << PKT_CTM_SIZE_256;
+    int ctm_part_len = UDP_PACKET_SZ_BYTES < (ctm_size - pkt_off) ? UDP_PACKET_SZ_BYTES : ctm_size - pkt_off;
+    if (dma_first_len > ctm_part_len) {
+        dma_packet_recv(pbuf+pkt_off, ctm_part_len);
+        dma_packet_recv(muptr, dma_first_len - ctm_part_len);
+        dma_packet_recv((__mem40 char*) muptr + dma_first_len - ctm_part_len, UDP_PACKET_SZ_BYTES - dma_first_len);
+    } else {
+        dma_packet_recv(pbuf+pkt_off, dma_first_len);
+        dma_packet_recv(pbuf+pkt_off+dma_first_len, ctm_part_len - dma_first_len);
+        dma_packet_recv(muptr, UDP_PACKET_SZ_BYTES - ctm_part_len);
+    }
+}
+
+volatile __export __mem uint64_t count;
+int main(void)
+{
+    int pkt_num, pkt_off;
+    __xread blm_buf_handle_t buf;
+    int blq = 0, i, q_dst;
+    __mem40 char *pbuf;
+    uint64_t curr_tx_head;
+    uint64_t curr_tx_tail;
+
+    // Required for packet sending.
+    __gpr struct pkt_ms_info msi_gen;
+    __imem struct nbi_meta_catamaran nbi_meta_gen;
+
+    // Required to save two part DMA lengths.
+    uint64_t two_part_dma_first_len = 0;
+    uint64_t two_part_dma_second_len = 0;
+
+    if (ctx() != 0) {
+        return 0;
+    }
+
+    tx_meta.head = 0;
+    tx_meta.tail = 0;
+    tx_meta.len = 0;
+
+    while (tx_meta.head == 0 || tx_meta.tail == 0 || tx_meta.len == 0) {
+    }
+
+    tx_buf_start = tx_meta.head;
+    pkt_off = PKT_NBI_OFFSET + MAC_PREPEND_BYTES;
+
+    for (;;) {
+        // Allocate a packet
+
+        /*
+         * Poll for a CTM buffer until one is returned
+         */
+        while (1) {
+            pkt_num = pkt_ctm_alloc(&ctm_credits_2, __ISLAND, PKT_CTM_SIZE_256, 1, 1);
+            if (pkt_num != CTM_ALLOC_ERR)
+                break;
+            // sleep(1000);
+            // mem_incr64((__mem void *) gen_pkt_ctm_wait);
+        }
+
+        /*
+         * Poll for MU buffer until one is returned.
+         */
+        while (blm_buf_alloc(&buf, blq) != 0) {
+            // sleep(1000);
+            mem_incr64((__mem void *) gen_pkt_blm_wait);
+        }
+
+        pbuf   = pkt_ctm_ptr40(__ISLAND, pkt_num, 0);
+
+        // Prepare the metadata in the CTM buffer
+        nbi_meta_gen.pkt_info.isl = __ISLAND;
+        nbi_meta_gen.pkt_info.pnum = pkt_num;
+
+        nbi_meta_gen.pkt_info.bls = blq;
+        nbi_meta_gen.pkt_info.muptr = buf;
+        nbi_meta_gen.pkt_info.split = 1;
+
+        nbi_meta_gen.pkt_info.len = 4 + UDP_PACKET_SZ_BYTES;
+        nbi_meta_gen.port = 3; // Correct?
+
+        for (i=0; i<sizeof(struct nbi_meta_catamaran); i++) {
+          *(pbuf+i) = *((__mem40 char*)&nbi_meta_gen + i);
+        }
+
+        while (1) {
+            curr_tx_tail = tx_meta.tail;
+            // Now check for a packet in TX ring and send.
+            if (tx_meta.head < curr_tx_tail) {
+                if (curr_tx_tail - tx_meta.head >= UDP_PACKET_SZ_BYTES) {
+                    break;
+                }
+            } else {
+                if (tx_meta.head == curr_tx_tail) {
+                    // TODO - This can happen only when TXing the first packet. Post
+                    // that, the user driver will always ensure tail is never equal to head. So, optimize this check?
+                } else {
+                    two_part_dma_first_len = (tx_buf_start + tx_meta.len) - tx_meta.head;
+                    two_part_dma_second_len = curr_tx_tail - tx_buf_start;
+
+                    if (two_part_dma_first_len + two_part_dma_second_len >= UDP_PACKET_SZ_BYTES) {
+                        // Can DMA in 2/3 parts - depending on if MU buffer will be used or not.
+                        //dma_packet_three_parts(pbuf, pkt_off, (__mem40 void*) nbi_meta_gen.pkt_info.muptr, two_part_dma_first_len);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (tx_meta.head + UDP_PACKET_SZ_BYTES <= (tx_buf_start + tx_meta.len)) {
+            // Can DMA in 1/2 parts - depending on if MU buffer will be used or not.
+            dma_packet(pbuf, pkt_off, (__mem40 void*) nbi_meta_gen.pkt_info.muptr);
+        } else {
+            // Can DMA in 2/3 parts - depending on if MU buffer will be used or not.
+            dma_packet_three_parts(pbuf, pkt_off, (__mem40 void*) nbi_meta_gen.pkt_info.muptr, two_part_dma_first_len);
+        }
+
+        q_dst  = PORT_TO_CHANNEL(nbi_meta_gen.port);
+        pkt_mac_egress_cmd_write(pbuf, pkt_off, 1, 1); // Write data to make the packet MAC egress generate L3 and L4 checksums
+
+        msi_gen = pkt_msd_write(pbuf, pkt_off - 4); // Write a packet modification script of NULL
+        pkt_nbi_send(__ISLAND,
+                     pkt_num,
+                     &msi_gen,
+                     UDP_PACKET_SZ_BYTES + 4,
+                     NBI,
+                     q_dst,
+                     nbi_meta_gen.seqr,
+                     nbi_meta_gen.seq,
+                     PKT_CTM_SIZE_256);
+    }
+
+    return 0;
+}
+
+/* -*-  Mode:C; c-basic-offset:4; tab-width:4 -*- */
+
