@@ -205,6 +205,23 @@ OBJ_$1__FLAGS += $2
 
 endef
 
+#f microcode.force_include
+#
+# Force inclusion of a header file
+# @param $1 object desciptor
+# @param $2 source code
+# @param $3 source directory
+#
+define microcode.force_include
+
+ifeq ($3,)
+OBJ_$1__FLAGS += -include $2.h
+else
+OBJ_$1__FLAGS += -include $3/$2.h
+endif
+
+endef
+
 #f micro_c.force_include
 #
 # Force inclusion of a header file
